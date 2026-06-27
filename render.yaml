@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: company-policy-assistant-backend
+    env: node
+    plan: free
+    branch: main
+    root: backend
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    healthCheckPath: /api/health
+
+  - type: static
+    name: company-policy-assistant-frontend
+    branch: main
+    root: frontend
+    buildCommand: npm install && npm run build
+    publishPath: dist
+    autoDeploy: true
