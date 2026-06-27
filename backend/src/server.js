@@ -5,8 +5,7 @@ import multer from "multer";
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import pdfParse from "pdf-parse";
 import Groq from "groq-sdk";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 
@@ -53,14 +52,10 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
-const execFileAsync = promisify(execFile);
-
 async function extractPdfText(pdfFilePath) {
-  const scriptPath = join(__dirname, "extract_pdf_text.py");
-  const { stdout } = await execFileAsync("python3", [scriptPath, pdfFilePath], {
-    cwd: __dirname
-  });
-  return String(stdout || "")
+  const pdfBuffer = readFileSync(pdfFilePath);
+  const data = await pdfParse(pdfBuffer);
+  return String(data.text || "")
     .replace(/\s+/g, " ")
     .trim();
 }
