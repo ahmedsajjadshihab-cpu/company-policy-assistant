@@ -2,11 +2,13 @@ import dotenv from "dotenv";
 import cors from "cors";
 import express from "express";
 import multer from "multer";
-import { existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import Groq from "groq-sdk";
-import pdfParse from "pdf-parse";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, "../.env") });
@@ -31,17 +33,88 @@ const upload = multer({
   }
 });
 
+const splitter = new RecursiveCharacterTextSplitter({
+  chunkSize: 900,
+  chunkOverlap: 120
+});
+
 let uploadedPolicyText = "";
 let activePolicy = null;
 let indexedChunks = 0;
+let policyChunks = [];
+let stats = {
+  documentsUploaded: 0,
+  questionsAsked: 0,
+  users: 0
+};
+let knownUsers = new Set();
 
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
+const execFileAsync = promisify(execFile);
+
+async function extractPdfText(pdfFilePath) {
+  const scriptPath = join(__dirname, "extract_pdf_text.py");
+  const { stdout } = await execFileAsync("python3", [scriptPath, pdfFilePath], {
+    cwd: __dirname
+  });
+  return String(stdout || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5176,http://127.0.0.1:5176")
   .split(",")
   .map((origin) => origin.trim());
+
+function normalizeText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scoreChunk(question, chunkText) {
+  const questionTokens = new Set(normalizeText(question).split(" ").filter(Boolean));
+  const chunkTokens = new Set(normalizeText(chunkText).split(" ").filter(Boolean));
+  const overlap = [...questionTokens].filter((token) => chunkTokens.has(token)).length;
+
+  if (questionTokens.size === 0) {
+    return 0;
+  }
+
+  const keywordScore = overlap / questionTokens.size;
+  const phraseScore = normalizeText(chunkText).includes(normalizeText(question)) ? 0.2 : 0;
+  return keywordScore + phraseScore;
+}
+
+function retrieveRelevantChunks(question) {
+  if (!policyChunks.length) {
+    return [];
+  }
+
+  return policyChunks
+    .map((chunk) => ({ ...chunk, score: scoreChunk(question, chunk.text) }))
+    .filter((chunk) => chunk.score >= 0.12)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 3);
+}
+
+async function askGroq({ systemContent, userContent }) {
+  const response = await groq.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    messages: [
+      { role: "system", content: systemContent },
+      { role: "user", content: userContent }
+    ],
+    temperature: 0.7
+  });
+
+  return response.choices?.[0]?.message?.content || "No response from Groq.";
+}
 
 app.use(
   cors({
@@ -75,13 +148,25 @@ app.post("/api/upload-policy", upload.single("policy"), async (req, res, next) =
       return;
     }
 
-    const data = await pdfParse(req.file.path);
-    uploadedPolicyText = (data.text || "").slice(0, 12000);
+    const parsedText = await extractPdfText(req.file.path);
+
+    if (!parsedText) {
+      throw new Error("The uploaded PDF did not contain readable text.");
+    }
+
+    const splitChunks = (await splitter.splitText(parsedText))
+      .map((chunk) => chunk.trim())
+      .filter(Boolean);
+
+    uploadedPolicyText = splitChunks.join("\n\n");
+    policyChunks = splitChunks.map((chunk) => ({ text: chunk, source: req.file.originalname || "policy.pdf" }));
+    indexedChunks = policyChunks.length;
     activePolicy = {
       fileName: req.file.originalname || "policy.pdf",
-      uploadedAt: new Date().toISOString()
+      uploadedAt: new Date().toISOString(),
+      textLength: parsedText.length
     };
-    indexedChunks = uploadedPolicyText ? 1 : 0;
+    stats.documentsUploaded += 1;
 
     unlinkSync(req.file.path);
 
@@ -102,6 +187,26 @@ app.post("/api/upload-policy", upload.single("policy"), async (req, res, next) =
   }
 });
 
+app.post("/api/track-login", (req, res) => {
+  const username = String(req.body?.username || "").trim().toLowerCase();
+  if (username) {
+    if (!knownUsers.has(username)) {
+      knownUsers.add(username);
+      stats.users = knownUsers.size;
+    }
+  }
+
+  res.json({ ok: true, users: stats.users });
+});
+
+app.get("/api/admin-stats", (_req, res) => {
+  res.json({
+    documentsUploaded: stats.documentsUploaded,
+    questionsAsked: stats.questionsAsked,
+    users: stats.users
+  });
+});
+
 app.post("/api/simple-chat", async (req, res, next) => {
   try {
     const message = String(req.body?.message || "").trim();
@@ -110,14 +215,13 @@ app.post("/api/simple-chat", async (req, res, next) => {
       return;
     }
 
-    const response = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [{ role: "user", content: message }],
-      temperature: 0.7
+    const reply = await askGroq({
+      systemContent: "You are a helpful assistant.",
+      userContent: message
     });
 
     res.json({
-      reply: response.choices?.[0]?.message?.content || "No response from Groq.",
+      reply,
       model: "llama-3.3-70b-versatile"
     });
   } catch (error) {
@@ -133,23 +237,58 @@ app.post("/api/chat", async (req, res, next) => {
       return;
     }
 
-    const response = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [
-        {
-          role: "system",
-          content: uploadedPolicyText
-            ? `You are a helpful policy assistant. Answer using only the uploaded policy content below. If the answer is not in the policy, say that the uploaded policy does not provide enough information.\n\nPolicy content:\n${uploadedPolicyText}`
-            : "You are a helpful policy assistant."
-        },
-        { role: "user", content: question }
-      ],
-      temperature: 0.7
+    stats.questionsAsked += 1;
+
+    if (!uploadedPolicyText || !policyChunks.length) {
+      res.json({
+        answer: "No policy document has been uploaded yet. I can still help with a general answer, but the uploaded PDF context is not available.",
+        sources: [],
+        grounded: false,
+        fallbackUsed: true
+      });
+      return;
+    }
+
+    const relevantChunks = retrieveRelevantChunks(question);
+
+    if (relevantChunks.length > 0) {
+      const contextText = relevantChunks.map((chunk) => chunk.text).join("\n\n");
+      const answer = await askGroq({
+        systemContent: [
+          "You are a policy support assistant.",
+          "Answer using only the uploaded PDF policy context provided below.",
+          "If the answer appears in the policy, respond clearly and concisely from that context.",
+          "Do not invent facts that are not in the uploaded policy."
+        ].join(" "),
+        userContent: `Question: ${question}\n\nPolicy context:\n${contextText}`
+      });
+
+      res.json({
+        answer,
+        sources: relevantChunks.map((chunk) => ({
+          page: 1,
+          preview: chunk.text.slice(0, 140)
+        })),
+        grounded: true,
+        fallbackUsed: false
+      });
+      return;
+    }
+
+    const fallbackAnswer = await askGroq({
+      systemContent: [
+        "You are a helpful assistant.",
+        "The uploaded policy does not contain enough information for this topic.",
+        "Provide a brief general answer only as a fallback, and clearly note that the uploaded policy did not provide enough information."
+      ].join(" "),
+      userContent: question
     });
 
     res.json({
-      answer: response.choices?.[0]?.message?.content || "No response from Groq.",
-      sources: []
+      answer: `The uploaded policy does not contain enough information for this topic. Here is a general AI answer instead:\n\n${fallbackAnswer}`,
+      sources: [],
+      grounded: false,
+      fallbackUsed: true
     });
   } catch (error) {
     next(error);

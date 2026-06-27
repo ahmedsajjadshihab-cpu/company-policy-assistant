@@ -1,6 +1,8 @@
 import React from "react";
 import ChatPage from "./pages/ChatPage.jsx";
 import PolicyPage from "./pages/PolicyPage.jsx";
+import LoginPage from "./pages/LoginPage.jsx";
+import { API_URL } from "./lib/api.js";
 
 function getRoute() {
   const path = window.location.pathname;
@@ -12,6 +14,14 @@ function getRoute() {
 
 export default function App() {
   const [route, setRoute] = React.useState(getRoute);
+  const [session, setSession] = React.useState(() => {
+    try {
+      const saved = window.localStorage.getItem("policy-session");
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
 
   React.useEffect(() => {
     function handlePopState() {
@@ -22,10 +32,42 @@ export default function App() {
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
+  React.useEffect(() => {
+    if (session) {
+      window.localStorage.setItem("policy-session", JSON.stringify(session));
+    } else {
+      window.localStorage.removeItem("policy-session");
+    }
+  }, [session]);
+
   function navigate(path) {
     if (path === route) return;
     window.history.pushState({}, "", path);
     setRoute(path);
+  }
+
+  async function handleLogin(nextSession) {
+    try {
+      await fetch(`${API_URL}/api/track-login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: nextSession.username, role: nextSession.role })
+      });
+    } catch {
+      // ignore tracking failures
+    }
+
+    setSession(nextSession);
+    navigate(nextSession.role === "admin" ? "/" : "/chat");
+  }
+
+  function handleLogout() {
+    setSession(null);
+    navigate("/login");
+  }
+
+  if (!session) {
+    return <LoginPage onLogin={handleLogin} />;
   }
 
   return (
@@ -45,9 +87,14 @@ export default function App() {
         >
           Chat Bot
         </button>
+        <div className="nav-spacer" />
+        <span className="session-badge">{session.role === "admin" ? "Admin" : "User"}</span>
+        <button type="button" className="ghost-button small" onClick={handleLogout}>
+          Logout
+        </button>
       </nav>
 
-      {route === "/chat" ? <ChatPage /> : <PolicyPage />}
+      {route === "/chat" ? <ChatPage /> : <PolicyPage role={session.role} />}
     </>
   );
 }
