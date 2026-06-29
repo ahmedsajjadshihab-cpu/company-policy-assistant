@@ -205,8 +205,9 @@ app.use(
   cors({
     origin(origin, callback) {
       const isLocalViteOrigin = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin || "");
+      const isVercelOrigin = (origin || "").endsWith(".vercel.app");
 
-      if (!origin || allowedOrigins.includes(origin) || isLocalViteOrigin) {
+      if (!origin || allowedOrigins.includes(origin) || isLocalViteOrigin || isVercelOrigin) {
         callback(null, true);
         return;
       }
