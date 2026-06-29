@@ -2,7 +2,6 @@ import React from "react";
 import ChatPage from "./pages/ChatPage.jsx";
 import PolicyPage from "./pages/PolicyPage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
-import { API_URL } from "./lib/api.js";
 
 function getRoute() {
   const path = window.location.pathname;
@@ -46,17 +45,7 @@ export default function App() {
     setRoute(path);
   }
 
-  async function handleLogin(nextSession) {
-    try {
-      await fetch(`${API_URL}/api/track-login`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: nextSession.username, role: nextSession.role })
-      });
-    } catch {
-      // ignore tracking failures
-    }
-
+  function handleLogin(nextSession) {
     setSession(nextSession);
     navigate(nextSession.role === "admin" ? "/" : "/chat");
   }

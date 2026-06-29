@@ -9,7 +9,7 @@ export default function ChatPage() {
   const [messages, setMessages] = React.useState([
     {
       role: "assistant",
-      text: "Hi! Ask about the company policy and I’ll answer from the uploaded PDF first, then fall back to general AI guidance if needed."
+      text: "Hi! Ask me anything — I’m powered by Groq."
     }
   ]);
   const messagesEndRef = React.useRef(null);
@@ -29,11 +29,16 @@ export default function ChatPage() {
     setError("");
     setMessages(nextMessages);
 
+    const history = nextMessages
+      .slice(0, -1)
+      .filter((message) => message.role === "user" || message.role === "assistant")
+      .map((message) => ({ role: message.role, content: message.text }));
+
     try {
-      const response = await fetch(`${API_URL}/api/chat`, {
+      const response = await fetch(`${API_URL}/api/simple-chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: text })
+        body: JSON.stringify({ message: text, history })
       });
       const data = await readApiResponse(response);
 
@@ -41,7 +46,7 @@ export default function ChatPage() {
         throw new Error(data.error || "Could not get a reply.");
       }
 
-      setMessages((current) => [...current, { role: "assistant", text: data.answer }]);
+      setMessages((current) => [...current, { role: "assistant", text: data.reply }]);
     } catch (err) {
       const message = getFriendlyError(err);
       setError(message);
@@ -58,7 +63,7 @@ export default function ChatPage() {
     setMessages([
       {
         role: "assistant",
-        text: "Chat cleared. Ask me about your policy questions again."
+        text: "Chat cleared. What would you like to talk about?"
       }
     ]);
     setError("");
@@ -74,7 +79,7 @@ export default function ChatPage() {
             </div>
             <div>
               <h2>Chat Bot</h2>
-              <p>Policy-aware chat with RAG and Groq.</p>
+              <p>Simple chat powered by Groq.</p>
             </div>
           </div>
           <button className="ghost-button" type="button" onClick={clearChat} disabled={sending}>
@@ -102,7 +107,7 @@ export default function ChatPage() {
               </div>
               <div className="bubble typing">
                 <Loader2 className="spin" size={18} />
-                Searching the policy context...
+                Thinking...
               </div>
             </article>
           )}
@@ -113,7 +118,7 @@ export default function ChatPage() {
           <input
             value={input}
             onChange={(event) => setInput(event.target.value)}
-            placeholder="Type your question..."
+            placeholder="Type your message..."
             disabled={sending}
           />
           <button className="send-button" type="submit" disabled={sending || !input.trim()}>

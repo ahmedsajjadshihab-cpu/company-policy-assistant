@@ -1,15 +1,24 @@
 # Company Policy RAG Assistant
 
-A small React + Node app that lets a company upload a policy PDF and ask questions answered with RAG over the uploaded document.
+A React + Node app that lets a company upload a policy PDF and ask questions answered with RAG over the uploaded document. Includes a simple chat page powered by Groq.
 
 ## Stack
 
-- Frontend: React, Vite, JavaScript, orange/white minimal UI
-- Backend: Node.js, Express, Multer
-- RAG: LangChain, OpenAI embeddings/chat model, local in-memory vector store
-- Document input: PDF upload and chunking
+- Frontend: React, Vite, JavaScript
+- Backend: Node.js, Express, Multer, Groq, pdfjs-dist (pure JavaScript — no Python)
+- AI: Groq (`llama-3.3-70b-versatile`)
+- Document input: PDF upload and keyword-based chunk retrieval
 
-## Setup
+## Login
+
+| Role  | Username | Password  |
+|-------|----------|-----------|
+| Admin | admin    | admin123  |
+| User  | user     | user123   |
+
+Only **admin** can upload PDFs. Users can chat and ask questions.
+
+## Local setup
 
 1. Install dependencies:
 
@@ -23,7 +32,13 @@ A small React + Node app that lets a company upload a policy PDF and ask questio
    cp backend/.env.example backend/.env
    ```
 
-3. Add your OpenAI API key in `backend/.env`.
+3. Paste your Groq API key in `backend/.env`:
+
+   ```env
+   GROQ_API_KEY=gsk_...
+   ```
+
+   Get a free key at [console.groq.com](https://console.groq.com).
 
 4. Run the app:
 
@@ -31,24 +46,53 @@ A small React + Node app that lets a company upload a policy PDF and ask questio
    npm run dev
    ```
 
-5. Open the frontend at:
+5. Open the frontend at [http://localhost:5173](http://localhost:5173)
 
-   ```text
-   http://localhost:5173
-   ```
+The backend runs on [http://localhost:5002](http://localhost:5002).
 
-The backend runs on `http://localhost:5002`.
+## Deploy to Render
 
-## How It Works
+This repo includes a [Render Blueprint](https://render.com/docs/blueprint-spec) at `render.yaml`.
 
-1. The company uploads a PDF policy document.
-2. The backend extracts text from the PDF and splits it into chunks.
-3. LangChain creates embeddings and stores them in a local vector store.
-4. When the user asks a question, the backend retrieves relevant policy chunks.
-5. The AI answers using only the retrieved policy context and returns source previews.
+### Option A — Blueprint (recommended)
 
-## Notes
+1. Push this repo to GitHub.
+2. In [Render Dashboard](https://dashboard.render.com), click **New → Blueprint**.
+3. Connect the repo and apply the blueprint.
+4. When prompted, set **GROQ_API_KEY** for the backend service (leave blank in repo; paste in Render UI).
+5. Wait for both services to deploy:
+   - `company-policy-assistant-backend` (Node web service)
+   - `company-policy-assistant-frontend` (static site)
 
-- This starter uses an in-memory vector store, so uploaded policy data resets when the backend restarts.
-- For production, replace `MemoryVectorStore` with a persistent vector database such as Chroma, Pinecone, Weaviate, Qdrant, or pgvector.
-- Do not commit your `.env` file or API keys.
+Render wires the frontend build to the backend URL automatically via `VITE_API_URL`.
+
+### Option B — Manual backend only
+
+1. **New → Web Service** on Render.
+2. Connect repo, set **Root Directory** to `backend`.
+3. Build command: `npm install`
+4. Start command: `npm start`
+5. Add environment variables:
+   - `GROQ_API_KEY` — your Groq key
+   - `CLIENT_ORIGIN` — your frontend URL (e.g. `https://your-app.onrender.com`)
+6. Deploy and note the backend URL (e.g. `https://your-backend.onrender.com`).
+
+For the frontend, either deploy as a Render static site with `VITE_API_URL` set to your backend URL at build time, or run locally pointing at the deployed backend.
+
+### Notes for production
+
+- Uploaded policy data is stored **in memory** and resets when the backend restarts or redeploys.
+- Render free-tier services spin down after inactivity; the first request may take ~30s to wake up.
+- Do not commit `.env` files or API keys.
+
+## How it works
+
+1. Upload a PDF policy document.
+2. The backend extracts text and splits it into chunks.
+3. When you ask a question, relevant chunks are retrieved by keyword overlap.
+4. Groq answers using the policy context, with a general fallback if nothing matches.
+
+## Pages
+
+- `/` — Policy Assistant (PDF upload + Q&A)
+- `/chat` — Simple chat bot

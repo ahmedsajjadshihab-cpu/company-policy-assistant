@@ -5,9 +5,14 @@ import multer from "multer";
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import pdfParse from "pdf-parse";
-import Groq from "groq-sdk";
-import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+
+// LangChain imports
+import { ChatGroq } from "@langchain/groq";
+import { Document } from "@langchain/core/documents";
+import { Embeddings } from "@langchain/core/embeddings";
+
+// pdfjs-dist import for Node.js ESM environment
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, "../.env") });
@@ -32,84 +37,169 @@ const upload = multer({
   }
 });
 
-const splitter = new RecursiveCharacterTextSplitter({
-  chunkSize: 900,
-  chunkOverlap: 120
-});
+// Custom TF-IDF Embeddings class conforming to the LangChain Embeddings interface
+class SimpleTfidfEmbeddings extends Embeddings {
+  constructor() {
+    super({});
+    this.vocab = [];
+    this.vocabIndex = new Map();
+    this.idf = [];
+  }
 
-let uploadedPolicyText = "";
+  tokenize(text) {
+    return String(text || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/gi, " ")
+      .split(/\s+/)
+      .filter(w => w.length > 2); // Filter short words/stopwords
+  }
+
+  async embedDocuments(documents) {
+    // 1. Extract vocabulary and document frequencies
+    const docTokens = documents.map(doc => this.tokenize(doc));
+    const wordSet = new Set();
+    const docFreq = new Map();
+
+    for (const tokens of docTokens) {
+      const uniqueTokens = new Set(tokens);
+      for (const token of uniqueTokens) {
+        wordSet.add(token);
+        docFreq.set(token, (docFreq.get(token) || 0) + 1);
+      }
+    }
+
+    this.vocab = Array.from(wordSet);
+    this.vocabIndex = new Map(this.vocab.map((w, idx) => [w, idx]));
+
+    // 2. Compute IDF for each word in vocabulary
+    const numDocs = documents.length;
+    this.idf = this.vocab.map(word => {
+      const df = docFreq.get(word) || 0;
+      // Standard smooth IDF formula
+      return Math.log(1 + (numDocs / (df || 1)));
+    });
+
+    // 3. Generate term-frequency vectors
+    return docTokens.map(tokens => this._vectorize(tokens));
+  }
+
+  async embedQuery(query) {
+    const tokens = this.tokenize(query);
+    return this._vectorize(tokens);
+  }
+
+  _vectorize(tokens) {
+    const vector = new Array(this.vocab.length).fill(0);
+    // Term Frequency (TF)
+    for (const token of tokens) {
+      if (this.vocabIndex.has(token)) {
+        const idx = this.vocabIndex.get(token);
+        vector[idx] += 1;
+      }
+    }
+    // Multiply TF by IDF
+    for (let i = 0; i < vector.length; i++) {
+      if (vector[i] > 0) {
+        vector[i] = vector[i] * this.idf[i];
+      }
+    }
+    // L2 Normalize
+    const magnitude = Math.sqrt(vector.reduce((sum, val) => sum + val * val, 0));
+    if (magnitude > 0) {
+      for (let i = 0; i < vector.length; i++) {
+        vector[i] /= magnitude;
+      }
+    }
+    return vector;
+  }
+}
+
+// In-Memory Vector Store implementation with cosine similarity search (equivalent to MemoryVectorStore)
+class SimpleVectorStore {
+  constructor(embeddings) {
+    this.embeddings = embeddings;
+    this.documents = [];
+    this.vectors = [];
+  }
+
+  async addDocuments(documents) {
+    this.documents.push(...documents);
+    const texts = documents.map(doc => doc.pageContent);
+    const newVectors = await this.embeddings.embedDocuments(texts);
+    this.vectors.push(...newVectors);
+  }
+
+  async similaritySearch(query, k = 4) {
+    const queryVector = await this.embeddings.embedQuery(query);
+    const scores = this.vectors.map((vec, idx) => {
+      // Dot product of normalized vectors represents cosine similarity
+      let dotProduct = 0;
+      const len = Math.min(vec.length, queryVector.length);
+      for (let i = 0; i < len; i++) {
+        dotProduct += vec[i] * queryVector[i];
+      }
+      return { doc: this.documents[idx], score: dotProduct };
+    });
+
+    // Sort by score descending
+    scores.sort((a, b) => b.score - a.score);
+    return scores.slice(0, k).map(item => item.doc);
+  }
+}
+
+// Custom Recursive Character Splitter to split document text into chunks
+function splitTextIntoChunks(text, chunkSize = 1000, chunkOverlap = 200) {
+  const words = text.split(/\s+/);
+  const chunks = [];
+  let currentChunkWords = [];
+  let currentLength = 0;
+
+  for (const word of words) {
+    currentChunkWords.push(word);
+    currentLength += word.length + 1; // including space
+
+    if (currentLength >= chunkSize) {
+      chunks.push(currentChunkWords.join(" "));
+      
+      // Calculate overlapping words to preserve context
+      const overlapWords = [];
+      let overlapLen = 0;
+      for (let i = currentChunkWords.length - 1; i >= 0; i--) {
+        const w = currentChunkWords[i];
+        if (overlapLen + w.length + 1 <= chunkOverlap) {
+          overlapWords.unshift(w);
+          overlapLen += w.length + 1;
+        } else {
+          break;
+        }
+      }
+      currentChunkWords = overlapWords;
+      currentLength = overlapLen;
+    }
+  }
+
+  if (currentChunkWords.length > 0) {
+    chunks.push(currentChunkWords.join(" "));
+  }
+
+  return chunks;
+}
+
+// In-Memory state for active policy and vector store
 let activePolicy = null;
 let indexedChunks = 0;
-let policyChunks = [];
-let stats = {
-  documentsUploaded: 0,
-  questionsAsked: 0,
-  users: 0
-};
-let knownUsers = new Set();
+let vectorStore = null;
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
+// Initialize Groq LLM via LangChain class
+const chatGroq = new ChatGroq({
+  apiKey: process.env.GROQ_API_KEY,
+  model: "llama-3.3-70b-versatile",
+  temperature: 0.7
 });
-
-async function extractPdfText(pdfFilePath) {
-  const pdfBuffer = readFileSync(pdfFilePath);
-  const data = await pdfParse(pdfBuffer);
-  return String(data.text || "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5176,http://127.0.0.1:5176")
   .split(",")
   .map((origin) => origin.trim());
-
-function normalizeText(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function scoreChunk(question, chunkText) {
-  const questionTokens = new Set(normalizeText(question).split(" ").filter(Boolean));
-  const chunkTokens = new Set(normalizeText(chunkText).split(" ").filter(Boolean));
-  const overlap = [...questionTokens].filter((token) => chunkTokens.has(token)).length;
-
-  if (questionTokens.size === 0) {
-    return 0;
-  }
-
-  const keywordScore = overlap / questionTokens.size;
-  const phraseScore = normalizeText(chunkText).includes(normalizeText(question)) ? 0.2 : 0;
-  return keywordScore + phraseScore;
-}
-
-function retrieveRelevantChunks(question) {
-  if (!policyChunks.length) {
-    return [];
-  }
-
-  return policyChunks
-    .map((chunk) => ({ ...chunk, score: scoreChunk(question, chunk.text) }))
-    .filter((chunk) => chunk.score >= 0.12)
-    .sort((left, right) => right.score - left.score)
-    .slice(0, 3);
-}
-
-async function askGroq({ systemContent, userContent }) {
-  const response = await groq.chat.completions.create({
-    model: "llama-3.3-70b-versatile",
-    messages: [
-      { role: "system", content: systemContent },
-      { role: "user", content: userContent }
-    ],
-    temperature: 0.7
-  });
-
-  return response.choices?.[0]?.message?.content || "No response from Groq.";
-}
 
 app.use(
   cors({
@@ -127,12 +217,30 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
+// Helper function to extract page-by-page text from PDF buffer using pdfjs-dist
+async function extractTextFromPdfBuffer(buffer) {
+  const data = new Uint8Array(buffer);
+  const loadingTask = pdfjsLib.getDocument({ data });
+  const pdf = await loadingTask.promise;
+  const pages = [];
+
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const textContent = await page.getTextContent();
+    const pageText = textContent.items.map((item) => item.str).join(" ").trim();
+    if (pageText) {
+      pages.push({ text: pageText, pageNumber: i });
+    }
+  }
+  return pages;
+}
+
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     policy: activePolicy,
     chunks: indexedChunks,
-    ready: Boolean(uploadedPolicyText)
+    ready: Boolean(vectorStore)
   });
 });
 
@@ -143,26 +251,43 @@ app.post("/api/upload-policy", upload.single("policy"), async (req, res, next) =
       return;
     }
 
-    const parsedText = await extractPdfText(req.file.path);
+    // 1. Read PDF file into memory buffer
+    const buffer = readFileSync(req.file.path);
 
-    if (!parsedText) {
-      throw new Error("The uploaded PDF did not contain readable text.");
+    // 2. Parse text page-by-page
+    const pages = await extractTextFromPdfBuffer(buffer);
+    if (pages.length === 0) {
+      throw new Error("Could not extract any text from the uploaded PDF.");
     }
 
-    const splitChunks = (await splitter.splitText(parsedText))
-      .map((chunk) => chunk.trim())
-      .filter(Boolean);
+    // 3. Convert pages to LangChain Documents and split them
+    const chunkedDocs = [];
+    for (const p of pages) {
+      const chunks = splitTextIntoChunks(p.text, 1000, 200);
+      for (const chunk of chunks) {
+        chunkedDocs.push(
+          new Document({
+            pageContent: chunk,
+            metadata: { page: p.pageNumber, source: req.file.originalname }
+          })
+        );
+      }
+    }
 
-    uploadedPolicyText = splitChunks.join("\n\n");
-    policyChunks = splitChunks.map((chunk) => ({ text: chunk, source: req.file.originalname || "policy.pdf" }));
-    indexedChunks = policyChunks.length;
+    // 4. Index into in-memory Vector Store
+    const embeddings = new SimpleTfidfEmbeddings();
+    const store = new SimpleVectorStore(embeddings);
+    await store.addDocuments(chunkedDocs);
+    vectorStore = store;
+
+    // 5. Update local state
     activePolicy = {
       fileName: req.file.originalname || "policy.pdf",
-      uploadedAt: new Date().toISOString(),
-      textLength: parsedText.length
+      uploadedAt: new Date().toISOString()
     };
-    stats.documentsUploaded += 1;
+    indexedChunks = chunkedDocs.length;
 
+    // 6. Cleanup temp uploaded file
     unlinkSync(req.file.path);
 
     res.json({
@@ -182,26 +307,6 @@ app.post("/api/upload-policy", upload.single("policy"), async (req, res, next) =
   }
 });
 
-app.post("/api/track-login", (req, res) => {
-  const username = String(req.body?.username || "").trim().toLowerCase();
-  if (username) {
-    if (!knownUsers.has(username)) {
-      knownUsers.add(username);
-      stats.users = knownUsers.size;
-    }
-  }
-
-  res.json({ ok: true, users: stats.users });
-});
-
-app.get("/api/admin-stats", (_req, res) => {
-  res.json({
-    documentsUploaded: stats.documentsUploaded,
-    questionsAsked: stats.questionsAsked,
-    users: stats.users
-  });
-});
-
 app.post("/api/simple-chat", async (req, res, next) => {
   try {
     const message = String(req.body?.message || "").trim();
@@ -210,13 +315,10 @@ app.post("/api/simple-chat", async (req, res, next) => {
       return;
     }
 
-    const reply = await askGroq({
-      systemContent: "You are a helpful assistant.",
-      userContent: message
-    });
+    const response = await chatGroq.invoke([{ role: "user", content: message }]);
 
     res.json({
-      reply,
+      reply: response.content || "No response from Groq.",
       model: "llama-3.3-70b-versatile"
     });
   } catch (error) {
@@ -232,58 +334,47 @@ app.post("/api/chat", async (req, res, next) => {
       return;
     }
 
-    stats.questionsAsked += 1;
+    let response;
+    let sources = [];
 
-    if (!uploadedPolicyText || !policyChunks.length) {
-      res.json({
-        answer: "No policy document has been uploaded yet. I can still help with a general answer, but the uploaded PDF context is not available.",
-        sources: [],
-        grounded: false,
-        fallbackUsed: true
-      });
-      return;
+    // Perform RAG if a policy is uploaded and indexed
+    if (vectorStore) {
+      // 1. Retrieve the top 4 most relevant chunks
+      const relevantDocs = await vectorStore.similaritySearch(question, 4);
+
+      // 2. Prepare structured context
+      const context = relevantDocs
+        .map((doc) => `[Page ${doc.metadata.page}]: ${doc.pageContent}`)
+        .join("\n\n");
+
+      // 3. Prepare sources metadata for frontend Q&A citation
+      sources = relevantDocs.map((doc) => ({
+        page: doc.metadata.page,
+        preview: doc.pageContent.slice(0, 150) + (doc.pageContent.length > 150 ? "..." : "")
+      }));
+
+      // 4. Invoke LLM with grounded context
+      response = await chatGroq.invoke([
+        {
+          role: "system",
+          content: `You are a helpful policy assistant. Answer the user's question using ONLY the provided policy context below. If the answer is not in the context, say that the uploaded policy does not provide enough information.\n\nContext:\n${context}`
+        },
+        { role: "user", content: question }
+      ]);
+    } else {
+      // Fallback to ungrounded policy assistant if no policy is uploaded yet
+      response = await chatGroq.invoke([
+        {
+          role: "system",
+          content: "You are a helpful policy assistant."
+        },
+        { role: "user", content: question }
+      ]);
     }
-
-    const relevantChunks = retrieveRelevantChunks(question);
-
-    if (relevantChunks.length > 0) {
-      const contextText = relevantChunks.map((chunk) => chunk.text).join("\n\n");
-      const answer = await askGroq({
-        systemContent: [
-          "You are a policy support assistant.",
-          "Answer using only the uploaded PDF policy context provided below.",
-          "If the answer appears in the policy, respond clearly and concisely from that context.",
-          "Do not invent facts that are not in the uploaded policy."
-        ].join(" "),
-        userContent: `Question: ${question}\n\nPolicy context:\n${contextText}`
-      });
-
-      res.json({
-        answer,
-        sources: relevantChunks.map((chunk) => ({
-          page: 1,
-          preview: chunk.text.slice(0, 140)
-        })),
-        grounded: true,
-        fallbackUsed: false
-      });
-      return;
-    }
-
-    const fallbackAnswer = await askGroq({
-      systemContent: [
-        "You are a helpful assistant.",
-        "The uploaded policy does not contain enough information for this topic.",
-        "Provide a brief general answer only as a fallback, and clearly note that the uploaded policy did not provide enough information."
-      ].join(" "),
-      userContent: question
-    });
 
     res.json({
-      answer: `The uploaded policy does not contain enough information for this topic. Here is a general AI answer instead:\n\n${fallbackAnswer}`,
-      sources: [],
-      grounded: false,
-      fallbackUsed: true
+      answer: response.content || "No response from Groq.",
+      sources
     });
   } catch (error) {
     next(error);

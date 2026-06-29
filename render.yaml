@@ -1,19 +1,41 @@
 services:
   - type: web
     name: company-policy-assistant-backend
-    env: node
+    runtime: node
     plan: free
     branch: main
-    root: backend
+    rootDir: backend
     buildCommand: npm install
     startCommand: npm start
     autoDeploy: true
     healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CLIENT_ORIGIN
+        fromService:
+          type: web
+          name: company-policy-assistant-frontend
+          envVarKey: RENDER_EXTERNAL_URL
 
-  - type: static
+  - type: web
     name: company-policy-assistant-frontend
+    runtime: static
+    plan: free
     branch: main
-    root: frontend
+    rootDir: frontend
     buildCommand: npm install && npm run build
-    publishPath: dist
+    staticPublishPath: dist
     autoDeploy: true
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: company-policy-assistant-backend
+          envVarKey: RENDER_EXTERNAL_URL

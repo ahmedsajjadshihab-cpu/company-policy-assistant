@@ -3,41 +3,6 @@ import React from "react";
 import { Bot, FileText, Loader2, Send, ShieldCheck, UploadCloud, UserRound } from "lucide-react";
 import { API_URL, getFriendlyError, readApiResponse } from "../lib/api.js";
 
-function readStoredArray(key, fallback = []) {
-  try {
-    const saved = window.localStorage.getItem(key);
-    return saved ? JSON.parse(saved) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function buildSimilarSuggestions(question, recentSearches) {
-  const normalized = String(question || "").toLowerCase();
-  const suggestions = [];
-
-  if (normalized.includes("leave") || normalized.includes("holiday")) {
-    suggestions.push("Annual leave policy");
-  }
-  if (normalized.includes("conduct") || normalized.includes("behavior")) {
-    suggestions.push("Code of conduct");
-  }
-  if (normalized.includes("remote") || normalized.includes("work")) {
-    suggestions.push("Remote work guidelines");
-  }
-  if (normalized.includes("benefit") || normalized.includes("salary") || normalized.includes("compensation")) {
-    suggestions.push("Benefits overview");
-  }
-
-  recentSearches.forEach((item) => {
-    if (item && item !== question) {
-      suggestions.push(item);
-    }
-  });
-
-  return [...new Set(suggestions)].slice(0, 5);
-}
-
 export default function PolicyPage({ role = "user" }) {
   const [file, setFile] = React.useState(null);
   const [policy, setPolicy] = React.useState(null);
@@ -52,50 +17,6 @@ export default function PolicyPage({ role = "user" }) {
     }
   ]);
   const [error, setError] = React.useState("");
-  const [stats, setStats] = React.useState({ documentsUploaded: 0, questionsAsked: 0, users: 0 });
-  const [recentSearches, setRecentSearches] = React.useState(() => readStoredArray("policy-recent", []));
-  const [history, setHistory] = React.useState(() => readStoredArray("policy-history", []));
-  const [similarSearches, setSimilarSearches] = React.useState([]);
-
-  React.useEffect(() => {
-    window.localStorage.setItem("policy-recent", JSON.stringify(recentSearches));
-  }, [recentSearches]);
-
-  React.useEffect(() => {
-    window.localStorage.setItem("policy-history", JSON.stringify(history));
-  }, [history]);
-
-  React.useEffect(() => {
-    async function refreshStats() {
-      if (role !== "admin") return;
-
-      try {
-        const response = await fetch(`${API_URL}/api/admin-stats`);
-        const data = await readApiResponse(response);
-        if (response.ok) {
-          setStats(data);
-        }
-      } catch {
-        // ignore stat refresh failures
-      }
-    }
-
-    refreshStats();
-  }, [role]);
-
-  async function refreshStats() {
-    if (role !== "admin") return;
-
-    try {
-      const response = await fetch(`${API_URL}/api/admin-stats`);
-      const data = await readApiResponse(response);
-      if (response.ok) {
-        setStats(data);
-      }
-    } catch {
-      // ignore
-    }
-  }
 
   async function uploadPolicy(event) {
     event.preventDefault();
@@ -129,7 +50,6 @@ export default function PolicyPage({ role = "user" }) {
           text: `Policy indexed successfully. I can now answer questions from ${data.policy.fileName}.`
         }
       ]);
-      await refreshStats();
     } catch (err) {
       setError(getFriendlyError(err));
     } finally {
@@ -159,29 +79,14 @@ export default function PolicyPage({ role = "user" }) {
         throw new Error(data.error || "Could not get an answer.");
       }
 
-      const answerText = data.answer || "I could not answer that yet.";
       setMessages((current) => [
         ...current,
         {
           role: "assistant",
-          text: answerText,
+          text: data.answer,
           sources: data.sources || []
         }
       ]);
-
-      const nextRecent = [cleanQuestion, ...recentSearches.filter((item) => item.toLowerCase() !== cleanQuestion.toLowerCase())].slice(0, 6);
-      setRecentSearches(nextRecent);
-      setHistory((current) => [
-        {
-          question: cleanQuestion,
-          answer: answerText,
-          grounded: Boolean(data.grounded),
-          createdAt: new Date().toISOString()
-        },
-        ...current
-      ].slice(0, 8));
-      setSimilarSearches(buildSimilarSuggestions(cleanQuestion, nextRecent));
-      await refreshStats();
     } catch (err) {
       setError(getFriendlyError(err));
       setMessages((current) => [
@@ -197,6 +102,13 @@ export default function PolicyPage({ role = "user" }) {
     <main className="app-shell">
       <section className="sidebar">
         <div className="brand">
+          {role === "admin" && (
+  <DashboardCards
+    policy={policy}
+    chunks={chunks}
+    messages={messages}
+  />
+)}
           <div className="brand-icon">
             <ShieldCheck size={28} />
           </div>
@@ -205,14 +117,6 @@ export default function PolicyPage({ role = "user" }) {
             <p>{role === "admin" ? "Admin can upload and update company policy documents." : "Ask questions about company policies and guidance."}</p>
           </div>
         </div>
-
-        {role === "admin" && (
-          <DashboardCards
-            policy={policy}
-            chunks={chunks}
-            stats={stats}
-          />
-        )}
 
         {role === "admin" ? (
           <form className="upload-panel" onSubmit={uploadPolicy}>
@@ -250,52 +154,6 @@ export default function PolicyPage({ role = "user" }) {
           </div>
         </div>
 
-        <div className="history-card">
-          <h3>Recent searches</h3>
-          {recentSearches.length ? (
-            <div className="chip-row">
-              {recentSearches.map((item) => (
-                <button key={item} type="button" className="chip-button" onClick={() => setQuestion(item)}>
-                  {item}
-                </button>
-              ))}
-            </div>
-          ) : (
-            <p className="history-empty">Your recent searches will appear here.</p>
-          )}
-        </div>
-
-        <div className="history-card">
-          <h3>Similar searches</h3>
-          {similarSearches.length ? (
-            <div className="chip-row">
-              {similarSearches.map((item) => (
-                <button key={item} type="button" className="chip-button" onClick={() => setQuestion(item)}>
-                  {item}
-                </button>
-              ))}
-            </div>
-          ) : (
-            <p className="history-empty">Ask a question to see related suggestions.</p>
-          )}
-        </div>
-
-        <div className="history-card">
-          <h3>History</h3>
-          {history.length ? (
-            <ul className="history-list">
-              {history.map((item, index) => (
-                <li key={`${item.question}-${index}`}>
-                  <strong>{item.question}</strong>
-                  <span>{item.grounded ? "Grounded from PDF" : "General AI fallback"}</span>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="history-empty">Search history will appear after your first question.</p>
-          )}
-        </div>
-
         {error && <div className="error-box">{error}</div>}
       </section>
 
@@ -303,7 +161,7 @@ export default function PolicyPage({ role = "user" }) {
         <div className="chat-header">
           <div>
             <h2>Ask about company policy</h2>
-            <p>Answers use the uploaded document as source context first, then general AI if needed.</p>
+            <p>Answers use the uploaded document as source context.</p>
           </div>
         </div>
 
@@ -319,7 +177,7 @@ export default function PolicyPage({ role = "user" }) {
                   <div className="sources">
                     {message.sources.slice(0, 3).map((source, sourceIndex) => (
                       <div className="source" key={`${source.page}-${sourceIndex}`}>
-                        <strong>Relevant snippet</strong>
+                        <strong>Page {source.page || "?"}</strong>
                         <span>{source.preview}</span>
                       </div>
                     ))}
