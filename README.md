@@ -6,7 +6,7 @@ A React + Node app that lets a company upload a policy PDF and ask questions ans
 
 - Frontend: React, Vite, JavaScript
 - Backend: Node.js, Express, Multer, Groq, pdfjs-dist (pure JavaScript — no Python)
-- AI: Groq (`llama-3.3-70b-versatile`)
+- AI: Groq (`openai/gpt-oss-20b` by default; configurable with `GROQ_MODEL`)
 - Document input: PDF upload and keyword-based chunk retrieval
 
 ## Login
@@ -36,6 +36,8 @@ Only **admin** can upload PDFs. Users can chat and ask questions.
 
    ```env
    GROQ_API_KEY=gsk_...
+   # Optional: override the default model for an enabled Groq model.
+   GROQ_MODEL=openai/gpt-oss-20b
    ```
 
    Get a free key at [console.groq.com](https://console.groq.com).

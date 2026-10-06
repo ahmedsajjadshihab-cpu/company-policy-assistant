@@ -18,6 +18,35 @@ export default function PolicyPage({ role = "user" }) {
   ]);
   const [error, setError] = React.useState("");
 
+  React.useEffect(() => {
+    let cancelled = false;
+
+    async function loadPolicyStatus() {
+      try {
+        const response = await fetch(`${API_URL}/api/health`);
+        const data = await readApiResponse(response);
+
+        if (!response.ok || cancelled) return;
+
+        setPolicy(data.policy || null);
+        setChunks(Number(data.chunks) || 0);
+        if (data.policy) {
+          setMessages([{
+            role: "assistant",
+            text: `A policy is ready. Ask me anything about ${data.policy.fileName}.`
+          }]);
+        }
+      } catch {
+        // The actionable connection message is shown only when someone uploads or asks a question.
+      }
+    }
+
+    loadPolicyStatus();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   async function uploadPolicy(event) {
     event.preventDefault();
     if (!file) {
@@ -102,13 +131,6 @@ export default function PolicyPage({ role = "user" }) {
     <main className="app-shell">
       <section className="sidebar">
         <div className="brand">
-          {role === "admin" && (
-  <DashboardCards
-    policy={policy}
-    chunks={chunks}
-    messages={messages}
-  />
-)}
           <div className="brand-icon">
             <ShieldCheck size={28} />
           </div>
@@ -117,6 +139,14 @@ export default function PolicyPage({ role = "user" }) {
             <p>{role === "admin" ? "Admin can upload and update company policy documents." : "Ask questions about company policies and guidance."}</p>
           </div>
         </div>
+
+        {role === "admin" && (
+          <DashboardCards
+            policy={policy}
+            chunks={chunks}
+            messages={messages}
+          />
+        )}
 
         {role === "admin" ? (
           <form className="upload-panel" onSubmit={uploadPolicy}>

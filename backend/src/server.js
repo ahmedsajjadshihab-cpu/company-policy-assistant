@@ -130,6 +130,11 @@ class SimpleVectorStore {
   }
 
   async similaritySearch(query, k = 4) {
+    const results = await this.similaritySearchWithScore(query, k);
+    return results.map(({ doc }) => doc);
+  }
+
+  async similaritySearchWithScore(query, k = 4) {
     const queryVector = await this.embeddings.embedQuery(query);
     const scores = this.vectors.map((vec, idx) => {
       // Dot product of normalized vectors represents cosine similarity
@@ -143,7 +148,7 @@ class SimpleVectorStore {
 
     // Sort by score descending
     scores.sort((a, b) => b.score - a.score);
-    return scores.slice(0, k).map(item => item.doc);
+    return scores.slice(0, k);
   }
 }
 
@@ -191,11 +196,21 @@ let indexedChunks = 0;
 let vectorStore = null;
 
 // Initialize Groq LLM via LangChain class
+const groqModel = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
+
 const chatGroq = new ChatGroq({
   apiKey: process.env.GROQ_API_KEY,
-  model: "llama-3.3-70b-versatile",
+  model: groqModel,
   temperature: 0.7
 });
+
+function ensureGroqIsConfigured() {
+  if (!process.env.GROQ_API_KEY) {
+    const error = new Error("The server is missing GROQ_API_KEY. Add it to backend/.env and restart the server.");
+    error.status = 503;
+    throw error;
+  }
+}
 
 const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5176,http://127.0.0.1:5176")
   .split(",")
@@ -311,17 +326,33 @@ app.post("/api/upload-policy", upload.single("policy"), async (req, res, next) =
 
 app.post("/api/simple-chat", async (req, res, next) => {
   try {
+    ensureGroqIsConfigured();
     const message = String(req.body?.message || "").trim();
     if (!message) {
       res.status(400).json({ error: "Message is required." });
       return;
     }
 
-    const response = await chatGroq.invoke([{ role: "user", content: message }]);
+    const history = Array.isArray(req.body?.history)
+      ? req.body.history
+          .slice(-12)
+          .filter((item) => item && ["user", "assistant"].includes(item.role))
+          .map((item) => ({ role: item.role, content: String(item.content || "").trim() }))
+          .filter((item) => item.content)
+      : [];
+
+    const response = await chatGroq.invoke([
+      {
+        role: "system",
+        content: "You are a helpful, concise assistant. Use the conversation history to maintain context."
+      },
+      ...history,
+      { role: "user", content: message }
+    ]);
 
     res.json({
       reply: response.content || "No response from Groq.",
-      model: "llama-3.3-70b-versatile"
+      model: groqModel
     });
   } catch (error) {
     next(error);
@@ -330,6 +361,7 @@ app.post("/api/simple-chat", async (req, res, next) => {
 
 app.post("/api/chat", async (req, res, next) => {
   try {
+    ensureGroqIsConfigured();
     const question = String(req.body?.question || "").trim();
     if (!question) {
       res.status(400).json({ error: "Question is required." });
@@ -342,7 +374,18 @@ app.post("/api/chat", async (req, res, next) => {
     // Perform RAG if a policy is uploaded and indexed
     if (vectorStore) {
       // 1. Retrieve the top 4 most relevant chunks
-      const relevantDocs = await vectorStore.similaritySearch(question, 4);
+      const matches = await vectorStore.similaritySearchWithScore(question, 4);
+      const relevantDocs = matches
+        .filter(({ score }) => score > 0)
+        .map(({ doc }) => doc);
+
+      if (relevantDocs.length === 0) {
+        res.json({
+          answer: "I could not find that information in the uploaded policy. Try using policy-specific terms or ask an administrator for clarification.",
+          sources: []
+        });
+        return;
+      }
 
       // 2. Prepare structured context
       const context = relevantDocs
@@ -403,8 +446,10 @@ if (existsSync(frontendDist)) {
 }
 
 app.use((error, _req, res, _next) => {
-  const status = error.statusCode || error.status || 500;
-  const message = error.message || "Something went wrong.";
+  const status = error.code === "LIMIT_FILE_SIZE" ? 413 : error.statusCode || error.status || 500;
+  const message = error.code === "LIMIT_FILE_SIZE"
+    ? "The PDF is too large. Upload a file smaller than 15 MB."
+    : error.message || "Something went wrong.";
   res.status(status).json({ error: message });
 });
 

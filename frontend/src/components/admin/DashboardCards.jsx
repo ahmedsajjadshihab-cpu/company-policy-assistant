@@ -24,7 +24,7 @@ function DashboardCards({ policy, chunks, messages }) {
 
       <StatCard
         title="Questions"
-        value={messages.length}
+        value={messages.filter((message) => message.role === "user").length}
         icon={<MessageCircle size={22} />}
       />
 
