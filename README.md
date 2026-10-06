@@ -52,38 +52,22 @@ The backend runs on [http://localhost:5002](http://localhost:5002).
 
 ## Deploy to Render
 
-This repo includes a [Render Blueprint](https://render.com/docs/blueprint-spec) at `render.yaml`.
-
-### Option A — Blueprint (recommended)
+The app deploys as **one Node web service**. The backend serves the built frontend at `/` and APIs at `/api`.
 
 1. Push this repo to GitHub.
-2. In [Render Dashboard](https://dashboard.render.com), click **New → Blueprint**.
-3. Connect the repo and apply the blueprint.
-4. When prompted, set **GROQ_API_KEY** for the backend service (leave blank in repo; paste in Render UI).
-5. Wait for both services to deploy:
-   - `company-policy-assistant-backend` (Node web service)
-   - `company-policy-assistant-frontend` (static site)
+2. In [Render Dashboard](https://dashboard.render.com), open your existing web service **or** create **New → Web Service**.
+3. Connect this repo and use the **repository root** (do not set Root Directory to `backend` or `frontend`).
+4. Build command: `npm run install:all && npm run build`
+5. Start command: `npm --prefix backend start`
+6. Health check path: `/api/health`
+7. Environment variables:
+   - `NODE_ENV` = `production`
+   - `GROQ_API_KEY` = your Groq key
+8. Deploy, then open the Render URL (for example `https://company-policy-assistant.onrender.com`).
 
-Render wires the frontend build to the backend URL automatically via `VITE_API_URL`.
+If an old backend-only service is still live, visiting it will show `Cannot GET /` because it had no website. Use this combined service instead.
 
-### Option B — Manual backend only
-
-1. **New → Web Service** on Render.
-2. Connect repo, set **Root Directory** to `backend`.
-3. Build command: `npm install`
-4. Start command: `npm start`
-5. Add environment variables:
-   - `GROQ_API_KEY` — your Groq key
-   - `CLIENT_ORIGIN` — your frontend URL (e.g. `https://your-app.onrender.com`)
-6. Deploy and note the backend URL (e.g. `https://your-backend.onrender.com`).
-
-For the frontend, either deploy as a Render static site with `VITE_API_URL` set to your backend URL at build time, or run locally pointing at the deployed backend.
-
-### Notes for production
-
-- Uploaded policy data is stored **in memory** and resets when the backend restarts or redeploys.
-- Render free-tier services spin down after inactivity; the first request may take ~30s to wake up.
-- Do not commit `.env` files or API keys.
+Free-tier services sleep after idle time; the first request can take about 30 seconds.
 
 ## How it works
 

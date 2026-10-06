@@ -206,8 +206,9 @@ app.use(
     origin(origin, callback) {
       const isLocalViteOrigin = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin || "");
       const isVercelOrigin = (origin || "").endsWith(".vercel.app");
+      const isRenderOrigin = (origin || "").endsWith(".onrender.com");
 
-      if (!origin || allowedOrigins.includes(origin) || isLocalViteOrigin || isVercelOrigin) {
+      if (!origin || allowedOrigins.includes(origin) || isLocalViteOrigin || isVercelOrigin || isRenderOrigin) {
         callback(null, true);
         return;
       }
@@ -382,14 +383,33 @@ app.post("/api/chat", async (req, res, next) => {
   }
 });
 
+const frontendDist = join(__dirname, "../../frontend/dist");
+
+if (existsSync(frontendDist)) {
+  app.use(express.static(frontendDist));
+  app.use((req, res, next) => {
+    if (req.path.startsWith("/api")) {
+      next();
+      return;
+    }
+
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      next();
+      return;
+    }
+
+    res.sendFile(join(frontendDist, "index.html"));
+  });
+}
+
 app.use((error, _req, res, _next) => {
   const status = error.statusCode || error.status || 500;
   const message = error.message || "Something went wrong.";
   res.status(status).json({ error: message });
 });
 
-const server = app.listen(port, () => {
-  console.log(`Policy RAG backend running on http://localhost:${port}`);
+const server = app.listen(port, "0.0.0.0", () => {
+  console.log(`Policy RAG backend running on port ${port}`);
 });
 
 server.on("error", (error) => {
