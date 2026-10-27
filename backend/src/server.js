@@ -207,11 +207,9 @@ let vectorStore = null;
 
 // Model fallback list - tries each in order until one works
 const GROQ_FALLBACK_MODELS = [
-  "llama3-8b-8192",
-  "llama3-70b-8192",
-  "llama-3.1-8b-instant",
-  "mixtral-8x7b-32768",
-  "gemma2-9b-it"
+  "openai/gpt-oss-20b",
+  "openai/gpt-oss-120b",
+  "qwen/qwen3.8-27b"
 ];
 
 const groqModel = process.env.GROQ_MODEL || GROQ_FALLBACK_MODELS[0];
@@ -485,7 +483,7 @@ app.post("/api/simple-chat", async (req, res, next) => {
 
     res.json({
       reply,
-      model: groqModel,
+      model: resolvedModel,
       accuracy: saved.accuracy,
       accuracyRate: saved.accuracyScore,
       searchId: saved.id
