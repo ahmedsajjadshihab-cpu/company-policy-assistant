@@ -83,7 +83,7 @@ export default function App() {
         </button>
       </nav>
 
-      {route === "/chat" ? <ChatPage /> : <PolicyPage role={session.role} />}
+      {route === "/chat" ? <ChatPage session={session} /> : <PolicyPage session={session} />}
     </>
   );
 }

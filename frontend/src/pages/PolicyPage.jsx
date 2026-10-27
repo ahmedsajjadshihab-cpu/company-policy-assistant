@@ -1,9 +1,14 @@
-import DashboardCards from "../components/admin/DashboardCards";
 import React from "react";
+import DashboardCards from "../components/admin/DashboardCards";
+import SearchHistory from "../components/SearchHistory.jsx";
+import UploadedFilesHistory from "../components/admin/UploadedFilesHistory.jsx";
+import AccuracyBadge from "../components/AccuracyBadge.jsx";
 import { Bot, FileText, Loader2, Send, ShieldCheck, UploadCloud, UserRound } from "lucide-react";
 import { API_URL, getFriendlyError, readApiResponse } from "../lib/api.js";
 
-export default function PolicyPage({ role = "user" }) {
+export default function PolicyPage({ session }) {
+  const role = session?.role || "user";
+  const username = session?.username || "";
   const [file, setFile] = React.useState(null);
   const [policy, setPolicy] = React.useState(null);
   const [chunks, setChunks] = React.useState(0);
@@ -13,10 +18,13 @@ export default function PolicyPage({ role = "user" }) {
   const [messages, setMessages] = React.useState([
     {
       role: "assistant",
-      text: "Upload a company policy PDF, then ask questions about rules, benefits, leave, conduct, or compliance."
+      text: "Upload a company policy PDF, then ask questions about rules, benefits, leave, conduct, or compliance. Each search result includes an AI accuracy score."
     }
   ]);
   const [error, setError] = React.useState("");
+  const [searches, setSearches] = React.useState([]);
+  const [uploads, setUploads] = React.useState([]);
+  const [stats, setStats] = React.useState({ total: 0, users: 0, admins: 0, averageAccuracy: 0 });
 
   React.useEffect(() => {
     let cancelled = false;
@@ -31,21 +39,60 @@ export default function PolicyPage({ role = "user" }) {
         setPolicy(data.policy || null);
         setChunks(Number(data.chunks) || 0);
         if (data.policy) {
-          setMessages([{
-            role: "assistant",
-            text: `A policy is ready. Ask me anything about ${data.policy.fileName}.`
-          }]);
+          setMessages([
+            {
+              role: "assistant",
+              text: `A policy is ready. Ask me anything about ${data.policy.fileName}.`
+            }
+          ]);
         }
       } catch {
-        // The actionable connection message is shown only when someone uploads or asks a question.
+        // Handled when user tries an action
       }
     }
 
     loadPolicyStatus();
+    loadSearches();
+    loadUploads();
+
     return () => {
       cancelled = true;
     };
   }, []);
+
+  async function loadSearches() {
+    try {
+      const params = new URLSearchParams({ username, role });
+      const [historyResponse, statsResponse] = await Promise.all([
+        fetch(`${API_URL}/api/searches?${params}`),
+        fetch(`${API_URL}/api/search-stats`)
+      ]);
+      const historyData = await readApiResponse(historyResponse);
+      const statsData = await readApiResponse(statsResponse);
+
+      if (historyResponse.ok) {
+        setSearches(historyData.searches || []);
+      }
+      if (statsResponse.ok) {
+        setStats(statsData);
+      }
+    } catch {
+      // Optional history during wake-up
+    }
+  }
+
+  async function loadUploads() {
+    if (role !== "admin") return;
+    try {
+      const response = await fetch(`${API_URL}/api/uploads`);
+      const data = await readApiResponse(response);
+      if (response.ok) {
+        setUploads(data.uploads || []);
+      }
+    } catch {
+      // Optional during wake-up
+    }
+  }
 
   async function uploadPolicy(event) {
     event.preventDefault();
@@ -59,6 +106,8 @@ export default function PolicyPage({ role = "user" }) {
 
     const formData = new FormData();
     formData.append("policy", file);
+    formData.append("username", username);
+    formData.append("role", role);
 
     try {
       const response = await fetch(`${API_URL}/api/upload-policy`, {
@@ -73,6 +122,13 @@ export default function PolicyPage({ role = "user" }) {
 
       setPolicy(data.policy);
       setChunks(data.chunks);
+      setFile(null);
+      if (data.uploads) {
+        setUploads(data.uploads);
+      } else {
+        await loadUploads();
+      }
+
       setMessages([
         {
           role: "assistant",
@@ -100,7 +156,7 @@ export default function PolicyPage({ role = "user" }) {
       const response = await fetch(`${API_URL}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: cleanQuestion })
+        body: JSON.stringify({ question: cleanQuestion, username, role })
       });
       const data = await readApiResponse(response);
 
@@ -113,14 +169,20 @@ export default function PolicyPage({ role = "user" }) {
         {
           role: "assistant",
           text: data.answer,
-          sources: data.sources || []
+          sources: data.sources || [],
+          accuracy: data.accuracy,
+          accuracyRate: data.accuracyRate ?? data.accuracy?.score
         }
       ]);
+      await loadSearches();
     } catch (err) {
       setError(getFriendlyError(err));
       setMessages((current) => [
         ...current,
-        { role: "assistant", text: "I could not answer that yet. Check the policy upload and backend setup." }
+        {
+          role: "assistant",
+          text: "I could not answer that yet. Check the policy upload and backend setup."
+        }
       ]);
     } finally {
       setAsking(false);
@@ -136,7 +198,11 @@ export default function PolicyPage({ role = "user" }) {
           </div>
           <div>
             <h1>Policy Assistant</h1>
-            <p>{role === "admin" ? "Admin can upload and update company policy documents." : "Ask questions about company policies and guidance."}</p>
+            <p>
+              {role === "admin"
+                ? "Admin portal: manage company policies, review upload history, and inspect all user searches."
+                : "Ask questions about company policies, benefits, code of conduct, and guidance."}
+            </p>
           </div>
         </div>
 
@@ -144,33 +210,41 @@ export default function PolicyPage({ role = "user" }) {
           <DashboardCards
             policy={policy}
             chunks={chunks}
-            messages={messages}
+            stats={stats}
+            uploadsCount={uploads.length}
           />
         )}
 
         {role === "admin" ? (
-          <form className="upload-panel" onSubmit={uploadPolicy}>
-            <label className="file-drop">
-              <UploadCloud size={28} />
-              <span>{file ? file.name : "Choose policy PDF"}</span>
-              <input
-                type="file"
-                accept="application/pdf,.pdf"
-                onChange={(event) => setFile(event.target.files?.[0] || null)}
-              />
-            </label>
-            <button className="primary-button" type="submit" disabled={uploading}>
-              {uploading ? <Loader2 className="spin" size={18} /> : <FileText size={18} />}
-              {uploading ? "Indexing..." : "Upload & Index"}
-            </button>
-          </form>
+          <div className="admin-upload-section">
+            <form className="upload-panel" onSubmit={uploadPolicy}>
+              <label className="file-drop">
+                <UploadCloud size={28} />
+                <span>{file ? file.name : "Choose policy PDF"}</span>
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  onChange={(event) => setFile(event.target.files?.[0] || null)}
+                />
+              </label>
+              <button className="primary-button" type="submit" disabled={uploading}>
+                {uploading ? <Loader2 className="spin" size={18} /> : <FileText size={18} />}
+                {uploading ? "Indexing..." : "Upload & Index"}
+              </button>
+            </form>
+
+            <UploadedFilesHistory
+              uploads={uploads}
+              activePolicyName={policy?.fileName}
+            />
+          </div>
         ) : (
           <div className="upload-panel">
             <div className="status-panel" style={{ border: "0", padding: 0, background: "transparent" }}>
               <span className={policy ? "status-dot ready" : "status-dot"} />
               <div>
                 <strong>Read-only access</strong>
-                <p>Only admins can upload or update company documents.</p>
+                <p>Only administrators can upload or update company documents.</p>
               </div>
             </div>
           </div>
@@ -179,10 +253,12 @@ export default function PolicyPage({ role = "user" }) {
         <div className="status-panel">
           <span className={policy ? "status-dot ready" : "status-dot"} />
           <div>
-            <strong>{policy ? "Policy ready" : "No policy indexed"}</strong>
-            <p>{policy ? `${policy.fileName} · ${chunks} chunks` : "Upload a PDF to begin."}</p>
+            <strong>{policy ? "Active Policy Ready" : "No Policy Indexed"}</strong>
+            <p>{policy ? `${policy.fileName} · ${chunks} chunks indexed` : "Upload a PDF document to begin."}</p>
           </div>
         </div>
+
+        <SearchHistory searches={searches} role={role} />
 
         {error && <div className="error-box">{error}</div>}
       </section>
@@ -191,7 +267,7 @@ export default function PolicyPage({ role = "user" }) {
         <div className="chat-header">
           <div>
             <h2>Ask about company policy</h2>
-            <p>Answers use the uploaded document as source context.</p>
+            <p>Answers are grounded in indexed policy documents with real-time AI accuracy scoring.</p>
           </div>
         </div>
 
@@ -203,6 +279,9 @@ export default function PolicyPage({ role = "user" }) {
               </div>
               <div className="bubble">
                 <p>{message.text}</p>
+                {(message.accuracy || typeof message.accuracyRate === "number") && (
+                  <AccuracyBadge accuracy={message.accuracy || message.accuracyRate} />
+                )}
                 {message.sources?.length > 0 && (
                   <div className="sources">
                     {message.sources.slice(0, 3).map((source, sourceIndex) => (
@@ -223,7 +302,7 @@ export default function PolicyPage({ role = "user" }) {
               </div>
               <div className="bubble typing">
                 <Loader2 className="spin" size={18} />
-                Searching policy context...
+                Searching policy context & computing reliability score...
               </div>
             </article>
           )}

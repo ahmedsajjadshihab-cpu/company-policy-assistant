@@ -3,16 +3,18 @@ import {
   Database,
   MessageCircle,
   ShieldCheck,
+  Percent,
+  Users
 } from "lucide-react";
 
 import StatCard from "./StatCard";
 
-function DashboardCards({ policy, chunks, messages }) {
+function DashboardCards({ policy, chunks, stats, uploadsCount }) {
   return (
     <div className="dashboard-cards">
       <StatCard
-        title="Documents"
-        value={policy ? 1 : 0}
+        title="Uploaded Files"
+        value={typeof uploadsCount === "number" ? uploadsCount : (policy ? 1 : 0)}
         icon={<FileText size={22} />}
       />
 
@@ -23,9 +25,21 @@ function DashboardCards({ policy, chunks, messages }) {
       />
 
       <StatCard
-        title="Questions"
-        value={messages.filter((message) => message.role === "user").length}
+        title="Searches Stored"
+        value={stats?.total ?? 0}
         icon={<MessageCircle size={22} />}
+      />
+
+      <StatCard
+        title="Avg Accuracy"
+        value={`${stats?.averageAccuracy ?? 0}%`}
+        icon={<Percent size={22} />}
+      />
+
+      <StatCard
+        title="User Searches"
+        value={stats?.users ?? 0}
+        icon={<Users size={22} />}
       />
 
       <StatCard

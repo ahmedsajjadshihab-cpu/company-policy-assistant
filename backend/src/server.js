@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 import cors from "cors";
 import express from "express";
 import multer from "multer";
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -13,6 +13,16 @@ import { Embeddings } from "@langchain/core/embeddings";
 
 // pdfjs-dist import for Node.js ESM environment
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import {
+  addSearch,
+  computeAccuracyScore,
+  computeAccuracyRate,
+  getSearchStats,
+  listSearches,
+  addUploadedFile,
+  listUploadedFiles,
+  getActiveUploadedFile
+} from "./database.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, "../.env") });
@@ -195,14 +205,8 @@ let activePolicy = null;
 let indexedChunks = 0;
 let vectorStore = null;
 
-// Initialize Groq LLM via LangChain class
-const groqModel = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
-
-const chatGroq = new ChatGroq({
-  apiKey: process.env.GROQ_API_KEY,
-  model: groqModel,
-  temperature: 0.7
-});
+// Initialize Groq LLM lazily via LangChain class
+const groqModel = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 function ensureGroqIsConfigured() {
   if (!process.env.GROQ_API_KEY) {
@@ -210,6 +214,15 @@ function ensureGroqIsConfigured() {
     error.status = 503;
     throw error;
   }
+}
+
+function getChatGroq() {
+  ensureGroqIsConfigured();
+  return new ChatGroq({
+    apiKey: process.env.GROQ_API_KEY,
+    model: groqModel,
+    temperature: 0.7
+  });
 }
 
 const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5176,http://127.0.0.1:5176")
@@ -261,6 +274,20 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
+app.get("/api/searches", (req, res) => {
+  const username = String(req.query.username || "").trim();
+  const role = req.query.role === "admin" ? "admin" : "user";
+  res.json({ searches: listSearches({ username, role }) });
+});
+
+app.get("/api/search-stats", (_req, res) => {
+  res.json(getSearchStats());
+});
+
+app.get("/api/uploads", (_req, res) => {
+  res.json({ uploads: listUploadedFiles() });
+});
+
 app.post("/api/upload-policy", upload.single("policy"), async (req, res, next) => {
   try {
     if (!req.file) {
@@ -297,12 +324,29 @@ app.post("/api/upload-policy", upload.single("policy"), async (req, res, next) =
     await store.addDocuments(chunkedDocs);
     vectorStore = store;
 
-    // 5. Update local state
+    // 5. Update local state and record in database
     activePolicy = {
       fileName: req.file.originalname || "policy.pdf",
       uploadedAt: new Date().toISOString()
     };
     indexedChunks = chunkedDocs.length;
+
+    // Persist active PDF copy for server restarts
+    try {
+      const activePdfPath = join(__dirname, "../data/active_policy.pdf");
+      writeFileSync(activePdfPath, buffer);
+    } catch (saveErr) {
+      console.warn("Could not save active policy copy:", saveErr.message);
+    }
+
+    const uploadRecord = addUploadedFile({
+      fileName: req.file.originalname || "policy.pdf",
+      originalName: req.file.originalname || "policy.pdf",
+      fileSize: req.file.size || buffer.length,
+      pageCount: pages.length,
+      chunksCount: chunkedDocs.length,
+      uploadedBy: req.body?.username || "admin"
+    });
 
     // 6. Cleanup temp uploaded file
     unlinkSync(req.file.path);
@@ -310,7 +354,9 @@ app.post("/api/upload-policy", upload.single("policy"), async (req, res, next) =
     res.json({
       message: "Policy indexed successfully.",
       policy: activePolicy,
-      chunks: indexedChunks
+      chunks: indexedChunks,
+      upload: uploadRecord,
+      uploads: listUploadedFiles()
     });
   } catch (error) {
     console.error("UPLOAD ERROR:");
@@ -341,7 +387,8 @@ app.post("/api/simple-chat", async (req, res, next) => {
           .filter((item) => item.content)
       : [];
 
-    const response = await chatGroq.invoke([
+    const groqClient = getChatGroq();
+    const response = await groqClient.invoke([
       {
         role: "system",
         content: "You are a helpful, concise assistant. Use the conversation history to maintain context."
@@ -350,9 +397,33 @@ app.post("/api/simple-chat", async (req, res, next) => {
       { role: "user", content: message }
     ]);
 
+    const reply = response.content || "No response from Groq.";
+    const accuracy = computeAccuracyScore({
+      similarityScore: null,
+      grounded: false,
+      question: message,
+      answer: reply,
+      sources: []
+    });
+
+    const saved = addSearch({
+      username: req.body?.username,
+      role: req.body?.role,
+      source: "chat",
+      question: message,
+      answer: reply,
+      sources: [],
+      grounded: false,
+      similarityScore: null,
+      accuracy
+    });
+
     res.json({
-      reply: response.content || "No response from Groq.",
-      model: groqModel
+      reply,
+      model: groqModel,
+      accuracy: saved.accuracy,
+      accuracyRate: saved.accuracyScore,
+      searchId: saved.id
     });
   } catch (error) {
     next(error);
@@ -370,22 +441,51 @@ app.post("/api/chat", async (req, res, next) => {
 
     let response;
     let sources = [];
+    let grounded = false;
+    let similarityScore = null;
+    let answer = "";
 
     // Perform RAG if a policy is uploaded and indexed
     if (vectorStore) {
       // 1. Retrieve the top 4 most relevant chunks
       const matches = await vectorStore.similaritySearchWithScore(question, 4);
-      const relevantDocs = matches
-        .filter(({ score }) => score > 0)
-        .map(({ doc }) => doc);
+      const relevantMatches = matches.filter(({ score }) => score > 0);
+      const relevantDocs = relevantMatches.map(({ doc }) => doc);
 
       if (relevantDocs.length === 0) {
-        res.json({
-          answer: "I could not find that information in the uploaded policy. Try using policy-specific terms or ask an administrator for clarification.",
+        answer = "I could not find that information in the uploaded policy. Try using policy-specific terms or ask an administrator for clarification.";
+        const accuracy = computeAccuracyScore({
+          similarityScore: 0,
+          grounded: false,
+          question,
+          answer,
           sources: []
+        });
+
+        const saved = addSearch({
+          username: req.body?.username,
+          role: req.body?.role,
+          source: "policy",
+          question,
+          answer,
+          sources: [],
+          grounded: false,
+          similarityScore: 0,
+          accuracy
+        });
+
+        res.json({
+          answer,
+          sources: [],
+          accuracy: saved.accuracy,
+          accuracyRate: saved.accuracyScore,
+          searchId: saved.id
         });
         return;
       }
+
+      similarityScore = relevantMatches[0]?.score ?? 0;
+      grounded = true;
 
       // 2. Prepare structured context
       const context = relevantDocs
@@ -399,7 +499,8 @@ app.post("/api/chat", async (req, res, next) => {
       }));
 
       // 4. Invoke LLM with grounded context
-      response = await chatGroq.invoke([
+      const groqClient = getChatGroq();
+      response = await groqClient.invoke([
         {
           role: "system",
           content: `You are a helpful policy assistant. Answer the user's question using ONLY the provided policy context below. If the answer is not in the context, say that the uploaded policy does not provide enough information.\n\nContext:\n${context}`
@@ -408,7 +509,8 @@ app.post("/api/chat", async (req, res, next) => {
       ]);
     } else {
       // Fallback to ungrounded policy assistant if no policy is uploaded yet
-      response = await chatGroq.invoke([
+      const groqClient = getChatGroq();
+      response = await groqClient.invoke([
         {
           role: "system",
           content: "You are a helpful policy assistant."
@@ -417,9 +519,33 @@ app.post("/api/chat", async (req, res, next) => {
       ]);
     }
 
-    res.json({
-      answer: response.content || "No response from Groq.",
+    answer = response.content || "No response from Groq.";
+    const accuracy = computeAccuracyScore({
+      similarityScore,
+      grounded,
+      question,
+      answer,
       sources
+    });
+
+    const saved = addSearch({
+      username: req.body?.username,
+      role: req.body?.role,
+      source: "policy",
+      question,
+      answer,
+      sources,
+      grounded,
+      similarityScore,
+      accuracy
+    });
+
+    res.json({
+      answer,
+      sources,
+      accuracy: saved.accuracy,
+      accuracyRate: saved.accuracyScore,
+      searchId: saved.id
     });
   } catch (error) {
     next(error);
@@ -452,6 +578,46 @@ app.use((error, _req, res, _next) => {
     : error.message || "Something went wrong.";
   res.status(status).json({ error: message });
 });
+
+// Restore active policy on startup if database has a record
+async function restoreActivePolicy() {
+  try {
+    const activeFile = getActiveUploadedFile();
+    const activePdfPath = join(__dirname, "../data/active_policy.pdf");
+    if (activeFile && existsSync(activePdfPath)) {
+      const buffer = readFileSync(activePdfPath);
+      const pages = await extractTextFromPdfBuffer(buffer);
+      if (pages.length > 0) {
+        const chunkedDocs = [];
+        for (const p of pages) {
+          const chunks = splitTextIntoChunks(p.text, 1000, 200);
+          for (const chunk of chunks) {
+            chunkedDocs.push(
+              new Document({
+                pageContent: chunk,
+                metadata: { page: p.pageNumber, source: activeFile.originalName }
+              })
+            );
+          }
+        }
+        const embeddings = new SimpleTfidfEmbeddings();
+        const store = new SimpleVectorStore(embeddings);
+        await store.addDocuments(chunkedDocs);
+        vectorStore = store;
+        activePolicy = {
+          fileName: activeFile.originalName,
+          uploadedAt: activeFile.uploadedAt
+        };
+        indexedChunks = chunkedDocs.length;
+        console.log(`[Startup] Restored active policy: ${activeFile.originalName} (${indexedChunks} chunks)`);
+      }
+    }
+  } catch (err) {
+    console.warn("[Startup] Notice: Could not restore active policy:", err.message);
+  }
+}
+
+restoreActivePolicy();
 
 const server = app.listen(port, "0.0.0.0", () => {
   console.log(`Policy RAG backend running on port ${port}`);
