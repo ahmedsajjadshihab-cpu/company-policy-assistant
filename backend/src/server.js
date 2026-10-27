@@ -205,8 +205,17 @@ let activePolicy = null;
 let indexedChunks = 0;
 let vectorStore = null;
 
-// Initialize Groq LLM lazily via LangChain class
-const groqModel = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+// Model fallback list - tries each in order until one works
+const GROQ_FALLBACK_MODELS = [
+  "llama3-8b-8192",
+  "llama3-70b-8192",
+  "llama-3.1-8b-instant",
+  "mixtral-8x7b-32768",
+  "gemma2-9b-it"
+];
+
+const groqModel = process.env.GROQ_MODEL || GROQ_FALLBACK_MODELS[0];
+let resolvedModel = groqModel;
 
 function ensureGroqIsConfigured() {
   if (!process.env.GROQ_API_KEY) {
@@ -216,13 +225,43 @@ function ensureGroqIsConfigured() {
   }
 }
 
-function getChatGroq() {
+function getChatGroq(modelOverride) {
   ensureGroqIsConfigured();
   return new ChatGroq({
     apiKey: process.env.GROQ_API_KEY,
-    model: groqModel,
+    model: modelOverride || resolvedModel,
     temperature: 0.7
   });
+}
+
+// Try to resolve the best available model on startup
+async function resolveGroqModel() {
+  if (!process.env.GROQ_API_KEY) return;
+
+  // If user explicitly set GROQ_MODEL, trust it
+  if (process.env.GROQ_MODEL) {
+    resolvedModel = process.env.GROQ_MODEL;
+    console.log(`[Groq] Using configured model: ${resolvedModel}`);
+    return;
+  }
+
+  const modelsToTry = GROQ_FALLBACK_MODELS;
+  for (const model of modelsToTry) {
+    try {
+      const testClient = new ChatGroq({
+        apiKey: process.env.GROQ_API_KEY,
+        model,
+        temperature: 0.7
+      });
+      await testClient.invoke([{ role: "user", content: "hi" }]);
+      resolvedModel = model;
+      console.log(`[Groq] Using model: ${resolvedModel}`);
+      return;
+    } catch (err) {
+      console.warn(`[Groq] Model "${model}" unavailable: ${err.message?.slice(0, 80)} — trying next...`);
+    }
+  }
+  console.warn("[Groq] All fallback models failed. Chat will return errors until GROQ_MODEL is set.");
 }
 
 const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5176,http://127.0.0.1:5176")
@@ -388,14 +427,40 @@ app.post("/api/simple-chat", async (req, res, next) => {
       : [];
 
     const groqClient = getChatGroq();
-    const response = await groqClient.invoke([
-      {
-        role: "system",
-        content: "You are a helpful, concise assistant. Use the conversation history to maintain context."
-      },
-      ...history,
-      { role: "user", content: message }
-    ]);
+    let response;
+    try {
+      response = await groqClient.invoke([
+        {
+          role: "system",
+          content: "You are a helpful, concise assistant. Use the conversation history to maintain context."
+        },
+        ...history,
+        { role: "user", content: message }
+      ]);
+    } catch (modelErr) {
+      // Try fallback models if configured model fails
+      let lastErr = modelErr;
+      for (const fallbackModel of GROQ_FALLBACK_MODELS) {
+        if (fallbackModel === resolvedModel) continue;
+        try {
+          const fallbackClient = getChatGroq(fallbackModel);
+          response = await fallbackClient.invoke([
+            {
+              role: "system",
+              content: "You are a helpful, concise assistant. Use the conversation history to maintain context."
+            },
+            ...history,
+            { role: "user", content: message }
+          ]);
+          resolvedModel = fallbackModel;
+          console.log(`[Groq] Switched to fallback model: ${fallbackModel}`);
+          break;
+        } catch (fallbackErr) {
+          lastErr = fallbackErr;
+        }
+      }
+      if (!response) throw lastErr;
+    }
 
     const reply = response.content || "No response from Groq.";
     const accuracy = computeAccuracyScore({
@@ -499,24 +564,72 @@ app.post("/api/chat", async (req, res, next) => {
       }));
 
       // 4. Invoke LLM with grounded context
-      const groqClient = getChatGroq();
-      response = await groqClient.invoke([
-        {
-          role: "system",
-          content: `You are a helpful policy assistant. Answer the user's question using ONLY the provided policy context below. If the answer is not in the context, say that the uploaded policy does not provide enough information.\n\nContext:\n${context}`
-        },
-        { role: "user", content: question }
-      ]);
+      const groqClientRag = getChatGroq();
+      let ragResponse;
+      try {
+        ragResponse = await groqClientRag.invoke([
+          {
+            role: "system",
+            content: `You are a helpful policy assistant. Answer the user's question using ONLY the provided policy context below. If the answer is not in the context, say that the uploaded policy does not provide enough information.\n\nContext:\n${context}`
+          },
+          { role: "user", content: question }
+        ]);
+      } catch (modelErr) {
+        let lastErr = modelErr;
+        for (const fallbackModel of GROQ_FALLBACK_MODELS) {
+          if (fallbackModel === resolvedModel) continue;
+          try {
+            const fb = getChatGroq(fallbackModel);
+            ragResponse = await fb.invoke([
+              {
+                role: "system",
+                content: `You are a helpful policy assistant. Answer the user's question using ONLY the provided policy context below. If the answer is not in the context, say that the uploaded policy does not provide enough information.\n\nContext:\n${context}`
+              },
+              { role: "user", content: question }
+            ]);
+            resolvedModel = fallbackModel;
+            break;
+          } catch (fallbackErr) {
+            lastErr = fallbackErr;
+          }
+        }
+        if (!ragResponse) throw lastErr;
+      }
+      response = ragResponse;
     } else {
       // Fallback to ungrounded policy assistant if no policy is uploaded yet
-      const groqClient = getChatGroq();
-      response = await groqClient.invoke([
-        {
-          role: "system",
-          content: "You are a helpful policy assistant."
-        },
-        { role: "user", content: question }
-      ]);
+      const groqClientFallback = getChatGroq();
+      let ungroundedResponse;
+      try {
+        ungroundedResponse = await groqClientFallback.invoke([
+          {
+            role: "system",
+            content: "You are a helpful policy assistant."
+          },
+          { role: "user", content: question }
+        ]);
+      } catch (modelErr) {
+        let lastErr = modelErr;
+        for (const fallbackModel of GROQ_FALLBACK_MODELS) {
+          if (fallbackModel === resolvedModel) continue;
+          try {
+            const fb = getChatGroq(fallbackModel);
+            ungroundedResponse = await fb.invoke([
+              {
+                role: "system",
+                content: "You are a helpful policy assistant."
+              },
+              { role: "user", content: question }
+            ]);
+            resolvedModel = fallbackModel;
+            break;
+          } catch (fallbackErr) {
+            lastErr = fallbackErr;
+          }
+        }
+        if (!ungroundedResponse) throw lastErr;
+      }
+      response = ungroundedResponse;
     }
 
     answer = response.content || "No response from Groq.";
@@ -618,6 +731,7 @@ async function restoreActivePolicy() {
 }
 
 restoreActivePolicy();
+resolveGroqModel();
 
 const server = app.listen(port, "0.0.0.0", () => {
   console.log(`Policy RAG backend running on port ${port}`);
